@@ -12,6 +12,10 @@ license: MIT
 把每日积分签到搬到 **GitHub 的服务器**上跑：你的电脑关机、休眠、出门旅行，都不影响签到。
 
 > 本技能是**自包含、可分享**的实现：脚本不含任何个人账号、仓库名或凭据，把它复制给任何人，对方按下面三步就能跑起来。
+>
+> **开源地址**：<https://github.com/lk610322lk-creator/workbuddy-cloud-checkin>（MIT）
+> 也可以直接 `git clone` 到 `~/.workbuddy/skills/` 下使用 —— **仓库根目录就是技能根目录**，克隆完即装好。
+> 不想用 git 就把仓库打包下载，解压到 `~/.workbuddy/skills/workbuddy-cloud-checkin/`。
 
 ## 它做什么
 
