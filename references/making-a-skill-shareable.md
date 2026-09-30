@@ -113,3 +113,64 @@ EX_DIRS = {"state", "__pycache__", ".git", "logs"}
    而响应体里随机 UUID 的 `requestId` 恰好含 `401` 就会误判（实测约 0.57%／次）。
 3. **`versions\current` 是文件不是目录**（见第 3 步）。
 4. **Windows 原生程序不认 MSYS 的 `/tmp`**（见第 4 步）。
+
+## 第 6 步：发布到 GitHub 公开仓库
+
+分享的下一站通常是公开仓库。开源**近似不可逆**（fork、网页存档、搜索缓存都会留痕），
+所以**开仓库前先过三道上闸**：
+
+| 闸门 | 查什么 | 怎么做 |
+|---|---|---|
+| ① 内容闸 | 有没有夹带凭据与个人痕迹 | 对**暂存区**跑正则扫描（不是只看工作区）：JWT `eyJ…`、SendKey `SCT…`／`sctp…`、`gh[pousr]_…`、`github_pat_…`、私钥 `BEGIN … PRIVATE KEY`、云密钥 `AKIA…`、个人 uid、用户名、机器路径、邮箱、公司名 |
+| ② 命名闸 | 会不会与已有仓库撞名 | `gh repo list --limit 40 --json name,visibility` —— 同账号下同名仓库只能存在一个，撞名会直接失败 |
+| ③ 身份闸 | 提交者邮箱会不会暴露 | 先看 `git config --global user.email`；为空或不想暴露，就用 GitHub 隐私邮箱 `<id>+<login>@users.noreply.github.com`（`id` 取自 `gh api user -q .id`），**只在本仓库设**，别改全局 |
+
+### 必备的 5 个工程件
+
+| 文件 | 作用 |
+|---|---|
+| `README.md` | 访客决定"用不用"的地方。建议含：一句话价值、原理图（GitHub 支持 mermaid）、三步上手、命令速查、配置表、FAQ、**兼容性分级（已实测 / 未验证分开写）**、免责声明 |
+| `LICENSE` | 不加协议等于"保留所有权利"，与"开源供人使用"直接矛盾。工具类项目首选 MIT |
+| `SECURITY.md` | 一旦涉及凭据就必须写明边界；还要写"误提交后的止血顺序：**先吊销凭据，再清历史**"——历史会被 fork 与缓存 |
+| `.gitignore` | 第一要务是挡住**状态目录**（本项目是 `state/`，含私有仓库名与令牌指纹） |
+| `.gitattributes` | 统一行尾，否则不同平台 clone 出来行为不一致 |
+
+`.gitattributes` 的最小可用写法：
+
+```gitattributes
+* text=auto eol=lf
+*.bat text eol=crlf   # Windows 批处理必须 CRLF，否则 cmd 解析异常
+```
+
+### 推送与验证
+
+```bash
+gh repo create <名字> --public --description "…"
+git remote add origin https://github.com/<账号>/<名字>.git
+GIT_TERMINAL_PROMPT=0 git push -u origin main
+```
+
+**验证要从公网侧、匿名做**，不能只看本地 `git log`：
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" https://raw.githubusercontent.com/<账号>/<名字>/main/README.md
+curl -s https://api.github.com/repos/<账号>/<名字>   # 确认 private=false 与 license
+```
+
+## 附 2：发布环节新踩的两个坑
+
+5. **本机 `credential.helper` 会让 `git push` 静默挂死。** Git for Windows 默认的
+   `credential.helper=helper-selector` 在**非交互**环境（脚本、CI、Agent）里会挂起等凭据输入，
+   表现为 `git push` 长时间无输出、最终被 SIGTERM 杀掉——**看起来像网络问题，其实是凭据助手在等人输入**。
+   解法：让 `gh` 接管 + 禁交互。
+   ```bash
+   gh auth setup-git --hostname github.com
+   GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never git push -u origin main
+   ```
+   > 通用化：**非交互环境下，任何"可能弹窗 / 等输入"的组件都会变成挂起，而不是报错。**
+
+6. **查仓库真实行尾要用 `git ls-files --eol`，不能用 `git show :path`。**
+   用 `git show :文件` 看索引内容时，**git 会先按属性做行尾转换再输出**，
+   于是明明 `.gitattributes` 正常生效，也会看到 CRLF、误判"归一化失效"。
+   `git ls-files --eol` 才反映真实存储（`i/` 索引、`w/` 工作区）。
+   > 通用化：**验证"会被转换过的输出"之前，先确认自己看到的是转换前还是转换后的形态。**
