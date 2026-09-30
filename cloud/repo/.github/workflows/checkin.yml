@@ -1,0 +1,230 @@
+name: WorkBuddy Daily Checkin
+
+on:
+  schedule:
+    # ---------- 主干：北京时间每天 08:30（= UTC 00:30） ----------
+    # GitHub cron 有 5~30 分钟延迟属正常。
+    # 历史：v1.0.15 之前是 09:00 / 12:30 / 21:00 三次幂等补签，v1.0.16 收敛为一次。
+    - cron: '30 0 * * *'
+
+    # ---------- 兜底：北京时间每天 20:30（= UTC 12:30） ----------
+    # 为什么需要：只有一条 cron 时，若那次运行整体没发生（GitHub 侧延迟/丢弃、
+    #   工作流被停用、runner 不可用），当天就没有第二次机会；又因为「今日已签到」
+    #   被静默，你连「今天没签上」都不会被通知到。
+    # 为什么零风险：签到接口本身幂等 —— 当天已签过会返回 code=10001，不会重复领取。
+    #   所以这条只会在「主干真的漏了」时签到成功（并推送一条带「兜底」字样的通知），
+    #   其余情况静默跳过、不打扰。
+    # 想再加/改时间点：直接在这份列表里增删即可（每条约 +5 分钟/月的 Actions 用量）。
+    - cron: '30 12 * * *'
+  workflow_dispatch:
+    inputs:
+      notify_test:
+        description: '只测试通知渠道（跳过签到）'
+        type: boolean
+        default: false
+      diag:
+        description: '只做令牌体检（指纹/签发时间/剩余/鉴权码 + 坏令牌对照），不签到'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# 定时与手动触发偶发重叠时排队执行，避免同一时刻并发调用签到接口
+concurrency:
+  group: workbuddy-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    # diag=true 时只体检、不签到（诊断运行不应改动签到状态）
+    if: ${{ !inputs.diag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # 仅为取得仓库内的 notify.sh（通知逻辑放在脚本里，避免长 shell 塞进 YAML）
+      # v5 起使用 Node 24；v4 会触发 Node 20 弃用告警（虽仍可运行）
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Call WorkBuddy checkin API
+        id: ck
+        if: ${{ !inputs.notify_test }}
+        env:
+          WB_TOKEN: ${{ secrets.WB_CHECKIN_TOKEN }}
+          WB_UID: ${{ secrets.WB_CHECKIN_UID }}
+        # ⚠️ 维护须知（踩过的坑，勿重犯）：
+        #   run: | 是 YAML 块标量，标量内所有行缩进必须 >= 10 个空格。
+        #   一旦出现顶格（0 缩进）的行，块标量会被提前终止，整份 YAML 解析失败：
+        #   表现为 push 后产生 0s failure 的运行，且 workflow_dispatch 调用报
+        #   422 "Workflow does not have 'workflow_dispatch' trigger"。
+        #   因此这里只写简单 shell，JSON 解析用 jq（ubuntu-latest 自带），不内联多行 python。
+        run: |
+          set -uo pipefail
+          API="https://copilot.tencent.com"
+          out() { printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; }
+
+          if [ -z "${WB_TOKEN:-}" ] || [ -z "${WB_UID:-}" ]; then
+            echo "::error::缺少 Secrets：WB_CHECKIN_TOKEN / WB_CHECKIN_UID"
+            out state error
+            out detail "缺少 Secrets（WB_CHECKIN_TOKEN / WB_CHECKIN_UID 为空），请在本地重跑 push-token-to-cloud.sh --force"
+            exit 1
+          fi
+
+          # 单次 curl 撞上 runner 网络抖动会得到 HTTP=000，进而被误判成「签到未成功」。
+          # 这里只对**网络层**失败（000 / 空 / 5xx）重试 3 次；业务响应（200、4xx）原样返回。
+          # 重试是安全的：daily-checkin 幂等（重复调用返回 code=10001，不会重复领取）。
+          # ⚠️ 诊断信息必须打到 stderr：调用方用 $( ) 捕获 stdout，混进去会破坏解析。
+          call_api() {
+            local path="$1" i=1 resp http
+            while : ; do
+              resp="$(curl -s -m 20 -w '\n%{http_code}' -X POST \
+                -H "Content-Type: application/json" \
+                -H "Accept: application/json" \
+                -H "Authorization: Bearer ${WB_TOKEN}" \
+                -H "X-User-Id: ${WB_UID}" \
+                -d '{}' "${API}/${path}" || true)"
+              http="$(printf '%s\n' "$resp" | tail -n 1)"
+              case "$http" in
+                000|""|5*) ;;
+                *) printf '%s\n' "$resp"; return 0 ;;
+              esac
+              if [ "$i" -ge 3 ]; then printf '%s\n' "$resp"; return 0; fi
+              echo ">> ${path} 第 ${i}/3 次返回 HTTP ${http:-无}（疑似网络抖动），5s 后重试 ..." >&2
+              sleep 5
+              i=$((i+1))
+            done
+          }
+
+          echo ">> 查询签到状态 ..."
+          STATUS="$(call_api billing/meter/checkin-status)"
+          ST_HTTP="$(printf '%s\n' "$STATUS" | tail -n 1)"
+          echo "checkin-status HTTP=${ST_HTTP}"
+          if [ "$ST_HTTP" = "401" ] || [ "$ST_HTTP" = "403" ]; then
+            echo "::error::令牌已失效（HTTP ${ST_HTTP}）→ 本机打开桌面端后跑 scripts/push-token-to-cloud.sh --force"
+            out state error
+            out detail "令牌已失效（HTTP ${ST_HTTP}），需本机跑 push-token-to-cloud.sh --force 更新 Secret"
+            exit 1
+          fi
+
+          echo ">> 执行签到 ..."
+          RESP="$(call_api billing/meter/daily-checkin)"
+          HTTP="$(printf '%s\n' "$RESP" | tail -n 1)"
+          BODY="$(printf '%s\n' "$RESP" | sed '$d')"
+          echo "daily-checkin HTTP=${HTTP}"
+
+          if [ "$HTTP" = "401" ] || [ "$HTTP" = "403" ]; then
+            echo "::error::令牌已失效（HTTP ${HTTP}）→ 本机打开桌面端后跑 scripts/push-token-to-cloud.sh --force"
+            out state error
+            out detail "令牌已失效（HTTP ${HTTP}），需本机跑 push-token-to-cloud.sh --force 更新 Secret"
+            exit 1
+          fi
+
+          CODE="$(printf '%s' "$BODY" | jq -r '.code // "nil"' 2>/dev/null)"
+          case "$CODE" in
+            0)
+              CREDIT="$(printf '%s' "$BODY" | jq -r '.data.credit // "-"')"
+              STREAK="$(printf '%s' "$BODY" | jq -r '.data.streak_days // "-"')"
+              echo "::notice::签到成功，领取 ${CREDIT} 积分，连续 ${STREAK} 天"
+              out state success
+              out detail "签到成功，领取 ${CREDIT} 积分，连续 ${STREAK} 天"
+              ;;
+            10001)
+              echo "::notice::今日已签到，无需重复领取"
+              out state already
+              out detail "今日已签到（本次为幂等重复触发，属正常）"
+              ;;
+            *)
+              echo "::error::签到未成功 code=${CODE} body=${BODY}"
+              out state error
+              out detail "签到未成功：code=${CODE}"
+              exit 1
+              ;;
+          esac
+
+      - name: Notify
+        if: always()
+        env:
+          NOTIFY_TEST: ${{ inputs.notify_test }}
+          CK_STATE: ${{ steps.ck.outputs.state }}
+          CK_DETAIL: ${{ steps.ck.outputs.detail }}
+          # 本次由哪条 cron 触发（仅 schedule 事件有值）——用于区分主干 / 兜底
+          SCHEDULE_CRON: ${{ github.event.schedule }}
+          NOTIFY_ROBOT_URL: ${{ secrets.NOTIFY_ROBOT_URL }}
+          NOTIFY_ROBOT_SECRET: ${{ secrets.NOTIFY_ROBOT_SECRET }}
+          NOTIFY_SERVERCHAN_KEY: ${{ secrets.NOTIFY_SERVERCHAN_KEY }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+        # 通知文案在此拼装后交给 notify.sh；渠道由 Secret 是否配置决定（未配则跳过）。
+        # 同样受块标量缩进规则约束：块内所有行缩进 >= 10 空格。
+        run: |
+          set -uo pipefail
+
+          # 判定本次是主干还是兜底：github.event.schedule 只在定时触发时有值，
+          # 其内容就是命中的那条 cron 表达式。
+          IS_FALLBACK=0
+          TRIGGER="手动触发"
+          case "${SCHEDULE_CRON:-}" in
+            "30 0 * * *")  TRIGGER="主干调度（08:30）" ;;
+            "30 12 * * *") TRIGGER="兜底调度（20:30）"; IS_FALLBACK=1 ;;
+            "")            TRIGGER="手动触发" ;;
+            *)             TRIGGER="定时调度（${SCHEDULE_CRON}）" ;;
+          esac
+
+          TITLE="WorkBuddy 每日签到"
+          DETAIL=""
+          if [ "${NOTIFY_TEST:-}" = "true" ]; then
+            TITLE="WorkBuddy 签到通知 · 测试"
+            DETAIL="这是一条测试消息，说明通知渠道已配置成功。"
+          elif [ "${CK_STATE:-}" = "success" ]; then
+            TITLE="WorkBuddy 签到成功"
+            DETAIL="${CK_DETAIL}"
+            # 「兜底那次才签上」= 主干当天没成功。必须点明，否则会被误读为一切照常。
+            if [ "$IS_FALLBACK" = "1" ]; then
+              TITLE="WorkBuddy 兜底补签成功"
+              DETAIL="⚠️ 当天主干（08:30）那次未签到成功，已由本次兜底补上。${CK_DETAIL}"
+            fi
+          elif [ "${CK_STATE:-}" = "already" ]; then
+            # 按需求：只在「签到成功」与「异常」时推送；幂等重复触发保持安静。
+            # 需要临时恢复成每次都推时，把下面这行改回拼装 TITLE/DETAIL 即可。
+            echo "本次结果：今日已签到（幂等重复触发）→ 按配置不推送通知。"
+            exit 0
+          else
+            TITLE="WorkBuddy 签到异常"
+            DETAIL="${CK_DETAIL:-签到步骤未产出结果，请查看 Actions 运行日志。}"
+          fi
+          # ⚠️ 严禁在块标量里写多行 shell 字符串（续行会掉缩进 → 整份 YAML 失效）。
+          #    一律用单行 printf 拼装换行。
+          # 北京时间用 UTC+8 直接算（GNU date，ubuntu-latest 自带），不依赖 tzdata
+          NOW="$(date -u -d '+8 hours' '+%Y-%m-%d %H:%M')"
+          LINK="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          MSG="$(printf '%s\n触发：%s\n时间：%s（北京时间）\n详情：%s' "$DETAIL" "$TRIGGER" "$NOW" "$LINK")"
+          bash notify.sh "$TITLE" "$MSG"
+
+  # ------------------------------------------------------------
+  # 令牌体检（手动触发：Actions → Run workflow → 勾选 diag）
+  # 只读：不签到、不改任何状态，只报告「云端持有的是哪把令牌、现在还能不能鉴权」。
+  # 用途：核对「本机换发新令牌后，先前镜像到云端的旧令牌是否失效」这类时序问题；
+  #       同时用一把人为损坏的令牌做对照，证明接口确实在鉴权（否则 200 无意义）。
+  # 对照组令牌来自可选 Secret WB_TEST_OLD_TOKEN（不配则该行显示「未配置」，不影响体检）。
+  # ------------------------------------------------------------
+  diag:
+    if: ${{ inputs.diag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Token diagnostics
+        env:
+          WB_TOKEN: ${{ secrets.WB_CHECKIN_TOKEN }}
+          WB_UID: ${{ secrets.WB_CHECKIN_UID }}
+          WB_OLD_TOKEN: ${{ secrets.WB_TEST_OLD_TOKEN }}
+        # 体检逻辑放在 diag-token.sh 里：一是与通知脚本同样便于维护，二是规避块标量缩进陷阱。
+        run: |
+          set -uo pipefail
+          bash diag-token.sh

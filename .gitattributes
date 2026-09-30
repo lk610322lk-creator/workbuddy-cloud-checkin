@@ -1,0 +1,13 @@
+# 统一行尾，避免不同平台 clone 后脚本行为不一致。
+# 规则从上到下匹配，后面的覆盖前面的。
+
+* text=auto eol=lf
+
+# Windows 批处理必须是 CRLF，否则 cmd 解析会异常（菜单文字错位、命令不执行）
+*.bat text eol=crlf
+
+# 二进制，不做行尾转换
+*.png binary
+*.jpg binary
+*.ico binary
+*.zip binary
